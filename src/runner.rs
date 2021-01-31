@@ -161,6 +161,16 @@ enum RunResult {
     NestedCall(FuncRef),
 }
 
+/// Step run result
+enum StepResult {
+    /// Function has returned (with a given number of reductions remaining).
+    Return(u64),
+    /// Function is calling other function (with a given number of reductions remaining).
+    NestedCall(FuncRef, u64),
+    /// Function has further instructions to be run (but ran out of reductions).
+    Continue
+}
+
 /// Function interpreter.
 pub struct Interpreter {
     value_stack: ValueStack,
@@ -339,11 +349,36 @@ impl Interpreter {
         function_context: &mut FunctionContext,
         instructions: &isa::Instructions,
     ) -> Result<RunResult, TrapKind> {
+        match self.step_function(function_context, instructions, 0)? {
+            StepResult::NestedCall(func_ref, ..) => {
+                return Ok(RunResult::NestedCall(func_ref));
+            }
+            StepResult::Return(..) => {
+                return Ok(RunResult::Return);
+            }
+            StepResult::Continue => {
+                panic!("Got a `StepResult::Continue` during a boundless function \
+                        execution (i.e. not stepping or otherwise limiting the \
+                        number of instructions executed at once), which should \
+                        be impossible since `Interpreter::step_function()` \
+                        should only emit this if reductions are in use (i.e. \
+                        `reductions > 0`).");
+            }
+        }
+    }
+
+    fn step_function(
+        &mut self,
+        function_context: &mut FunctionContext,
+        instructions: &isa::Instructions,
+        reductions: u64
+    ) -> Result<StepResult, TrapKind> {
         let mut iter = instructions.iterate_from(function_context.position);
+        let mut count: u64 = 0;
 
         loop {
             let instruction = iter.next().expect(
-                "Ran out of instructions, this should be impossible \
+                "Ran out of instructions, which should be impossible \
                  since validation ensures that we either have an explicit \
                  return or an implicit block `end`.",
             );
@@ -356,16 +391,23 @@ impl Interpreter {
                 }
                 InstructionOutcome::ExecuteCall(func_ref) => {
                     function_context.position = iter.position();
-                    return Ok(RunResult::NestedCall(func_ref));
+                    return Ok(StepResult::NestedCall(func_ref, reductions - count));
                 }
                 InstructionOutcome::Return(drop_keep) => {
                     self.value_stack.drop_keep(drop_keep);
-                    break;
+                    return Ok(StepResult::Return(reductions - count));
                 }
             }
-        }
 
-        Ok(RunResult::Return)
+            // Don't bother incrementing the counter if we ain't actually limiting the number of iterations.
+            if reductions > 0 {
+                if count >= reductions {
+                    function_context.position = iter.position();
+                    return Ok(StepResult::Continue);
+                }
+                count += 1;
+            }
+        }
     }
 
     #[inline(always)]
