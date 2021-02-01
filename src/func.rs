@@ -180,6 +180,67 @@ impl FuncInstance {
         }
     }
 
+    /// Invoke this function.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `args` types is not match function [`signature`] or
+    /// if [`Trap`] at execution time occured.
+    ///
+    /// [`signature`]: #method.signature
+    /// [`Trap`]: #enum.Trap.html
+    pub async fn async_invoke<E: Externals>(
+        func: &FuncRef,
+        args: &[RuntimeValue],
+        externals: &mut E,
+        reductions: u64,
+    ) -> Result<Option<RuntimeValue>, Trap> {
+        check_function_args(func.signature(), &args)?;
+        match *func.as_internal() {
+            FuncInstanceInternal::Internal { .. } => {
+                let mut interpreter = Interpreter::new(func, args, None)?;
+                interpreter
+                    .async_start_execution(externals, reductions)
+                    .await
+            }
+            FuncInstanceInternal::Host {
+                ref host_func_index,
+                ..
+            } => externals.invoke_index(*host_func_index, args.into()),
+        }
+    }
+
+    /// Invoke this function using recycled stacks.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`invoke`].
+    ///
+    /// [`invoke`]: #method.invoke
+    pub async fn async_invoke_with_stack<E: Externals>(
+        func: &FuncRef,
+        args: &[RuntimeValue],
+        externals: &mut E,
+        stack_recycler: &mut StackRecycler,
+        reductions: u64,
+    ) -> Result<Option<RuntimeValue>, Trap> {
+        check_function_args(func.signature(), &args)?;
+        match *func.as_internal() {
+            FuncInstanceInternal::Internal { .. } => {
+                let mut interpreter = Interpreter::new(func, args, Some(stack_recycler))?;
+                let return_value = interpreter
+                    .async_start_execution(externals, reductions)
+                    .await;
+                stack_recycler.recycle(interpreter);
+                return_value
+            }
+            FuncInstanceInternal::Host {
+                ref host_func_index,
+                ..
+            } => externals.invoke_index(*host_func_index, args.into()),
+        }
+    }
+
     /// Invoke the function, get a resumable handle. This handle can then be used to [`start_execution`]. If a
     /// Host trap happens, caller can use [`resume_execution`] to feed the expected return value back in, and then
     /// continue the execution.
@@ -308,6 +369,42 @@ impl<'args> FuncInvocation<'args> {
                 *finished = true;
                 Ok(externals.invoke_index(*host_func_index, args.as_ref().into())?)
             }
+        }
+    }
+
+    /// Resume an execution if a previous trap of Host kind happened.
+    ///
+    /// `return_val` must be of the value type [`resumable_value_type`], defined by the host function import. Otherwise,
+    /// `UnexpectedSignature` trap will be returned. The current invocation must also be resumable
+    /// [`is_resumable`]. Otherwise, a `NotResumable` error will be returned.
+    ///
+    /// [`resumable_value_type`]: #method.resumable_value_type
+    /// [`is_resumable`]: #method.is_resumable
+    pub async fn async_resume_execution<'externals, E: Externals + 'externals>(
+        &mut self,
+        return_val: Option<RuntimeValue>,
+        externals: &'externals mut E,
+        reductions: u64,
+    ) -> Result<Option<RuntimeValue>, ResumableError> {
+        use crate::TrapKind;
+
+        if return_val.map(|v| v.value_type()) != self.resumable_value_type() {
+            return Err(ResumableError::Trap(Trap::new(
+                TrapKind::UnexpectedSignature,
+            )));
+        }
+
+        match &mut self.kind {
+            FuncInvocationKind::Internal(interpreter) => {
+                if interpreter.state().is_resumable() {
+                    Ok(interpreter
+                        .async_resume_execution(return_val, externals, reductions)
+                        .await?)
+                } else {
+                    Err(ResumableError::AlreadyStarted)
+                }
+            }
+            FuncInvocationKind::Host { .. } => Err(ResumableError::NotResumable),
         }
     }
 
