@@ -1,6 +1,5 @@
 #![allow(clippy::unnecessary_wraps)]
 
-use crate::func::{FuncInstance, FuncInstanceInternal, FuncRef};
 use crate::host::Externals;
 use crate::isa;
 use crate::memory::MemoryRef;
@@ -10,6 +9,10 @@ use crate::nan_preserving_float::{F32, F64};
 use crate::value::{
     ArithmeticOps, ExtendInto, Float, Integer, LittleEndianConvert, RuntimeValue, TransmuteInto,
     TryTruncateInto, WrapInto,
+};
+use crate::{
+    func::{FuncInstance, FuncInstanceInternal, FuncRef},
+    park,
 };
 use crate::{Signature, Trap, TrapKind, ValueType};
 use alloc::{boxed::Box, vec::Vec};
@@ -168,7 +171,7 @@ enum StepResult {
     /// Function is calling other function (with a given number of reductions remaining).
     NestedCall(FuncRef, u64),
     /// Function has further instructions to be run (but ran out of reductions).
-    Continue
+    Continue,
 }
 
 /// Function interpreter.
@@ -233,6 +236,27 @@ impl Interpreter {
         Ok(opt_return_value)
     }
 
+    pub async fn async_start_execution<'a, E: Externals + 'a>(
+        &mut self,
+        externals: &'a mut E,
+        reductions: u64,
+    ) -> Result<Option<RuntimeValue>, Trap> {
+        // Ensure that the VM has not been executed. This is checked in `FuncInvocation::start_execution`.
+        assert!(self.state == InterpreterState::Initialized);
+
+        self.state = InterpreterState::Started;
+        self.async_interpreter_loop(externals, reductions).await?;
+
+        let opt_return_value = self
+            .return_type
+            .map(|vt| self.value_stack.pop().with_type(vt));
+
+        // Ensure that stack is empty after the execution. This is guaranteed by the validation properties.
+        assert!(self.value_stack.len() == 0);
+
+        Ok(opt_return_value)
+    }
+
     pub fn resume_execution<'a, E: Externals + 'a>(
         &mut self,
         return_val: Option<RuntimeValue>,
@@ -253,6 +277,38 @@ impl Interpreter {
         }
 
         self.run_interpreter_loop(externals)?;
+
+        let opt_return_value = self
+            .return_type
+            .map(|vt| self.value_stack.pop().with_type(vt));
+
+        // Ensure that stack is empty after the execution. This is guaranteed by the validation properties.
+        assert!(self.value_stack.len() == 0);
+
+        Ok(opt_return_value)
+    }
+
+    pub async fn async_resume_execution<'a, E: Externals + 'a>(
+        &mut self,
+        return_val: Option<RuntimeValue>,
+        externals: &'a mut E,
+        reductions: u64,
+    ) -> Result<Option<RuntimeValue>, Trap> {
+        use core::mem::swap;
+
+        // Ensure that the VM is resumable. This is checked in `FuncInvocation::resume_execution`.
+        assert!(self.state.is_resumable());
+
+        let mut resumable_state = InterpreterState::Started;
+        swap(&mut self.state, &mut resumable_state);
+
+        if let Some(return_val) = return_val {
+            self.value_stack
+                .push(return_val.into())
+                .map_err(Trap::new)?;
+        }
+
+        self.async_interpreter_loop(externals, reductions).await?;
 
         let opt_return_value = self
             .return_type
@@ -344,6 +400,88 @@ impl Interpreter {
         }
     }
 
+    async fn async_interpreter_loop<'a, E: Externals + 'a>(
+        &mut self,
+        externals: &'a mut E,
+        reductions: u64,
+    ) -> Result<(), Trap> {
+        loop {
+            let mut function_context = self.call_stack.pop().expect(
+                "on loop entry - not empty; on loop continue - checking for emptiness; qed",
+            );
+            let function_ref = function_context.function.clone();
+            let function_body = function_ref
+				.body()
+				.expect(
+					"Host functions checked in function_return below; Internal functions always have a body; qed"
+				);
+
+            if !function_context.is_initialized() {
+                // Initialize stack frame for the function call.
+                function_context.initialize(&function_body.locals, &mut self.value_stack)?;
+            }
+
+            let function_return = self
+                .async_run_function(&mut function_context, &function_body.code, reductions)
+                .await
+                .map_err(Trap::new)?;
+
+            match function_return {
+                RunResult::Return => {
+                    if self.call_stack.is_empty() {
+                        // This was the last frame in the call stack. This means we
+                        // are done executing.
+                        return Ok(());
+                    }
+                }
+                RunResult::NestedCall(nested_func) => {
+                    if self.call_stack.is_full() {
+                        return Err(TrapKind::StackOverflow.into());
+                    }
+
+                    match *nested_func.as_internal() {
+                        FuncInstanceInternal::Internal { .. } => {
+                            let nested_context = FunctionContext::new(nested_func.clone());
+                            self.call_stack.push(function_context);
+                            self.call_stack.push(nested_context);
+                        }
+                        FuncInstanceInternal::Host { ref signature, .. } => {
+                            let args = prepare_function_args(signature, &mut self.value_stack);
+                            // We push the function context first. If the VM is not resumable, it does no harm. If it is, we then save the context here.
+                            self.call_stack.push(function_context);
+
+                            let return_val =
+                                match FuncInstance::invoke(&nested_func, &args, externals) {
+                                    Ok(val) => val,
+                                    Err(trap) => {
+                                        if trap.kind().is_host() {
+                                            self.state = InterpreterState::Resumable(
+                                                nested_func.signature().return_type(),
+                                            );
+                                        }
+                                        return Err(trap);
+                                    }
+                                };
+
+                            // Check if `return_val` matches the signature.
+                            let value_ty = return_val.as_ref().map(|val| val.value_type());
+                            let expected_ty = nested_func.signature().return_type();
+                            if value_ty != expected_ty {
+                                return Err(TrapKind::UnexpectedSignature.into());
+                            }
+
+                            if let Some(return_val) = return_val {
+                                self.value_stack
+                                    .push(return_val.into())
+                                    .map_err(Trap::new)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn do_run_function(
         &mut self,
         function_context: &mut FunctionContext,
@@ -357,12 +495,33 @@ impl Interpreter {
                 return Ok(RunResult::Return);
             }
             StepResult::Continue => {
-                panic!("Got a `StepResult::Continue` during a boundless function \
+                panic!(
+                    "Got a `StepResult::Continue` during a boundless function \
                         execution (i.e. not stepping or otherwise limiting the \
                         number of instructions executed at once), which should \
                         be impossible since `Interpreter::step_function()` \
                         should only emit this if reductions are in use (i.e. \
-                        `reductions > 0`).");
+                        `reductions > 0`)."
+                );
+            }
+        }
+    }
+
+    async fn async_run_function(
+        &mut self,
+        function_context: &mut FunctionContext,
+        instructions: &isa::Instructions,
+        reductions: u64,
+    ) -> Result<RunResult, TrapKind> {
+        loop {
+            match self.step_function(function_context, instructions, reductions)? {
+                StepResult::NestedCall(func_ref, ..) => {
+                    return Ok(RunResult::NestedCall(func_ref));
+                }
+                StepResult::Return(..) => {
+                    return Ok(RunResult::Return);
+                }
+                StepResult::Continue => park::yield_now().await,
             }
         }
     }
@@ -371,7 +530,7 @@ impl Interpreter {
         &mut self,
         function_context: &mut FunctionContext,
         instructions: &isa::Instructions,
-        reductions: u64
+        reductions: u64,
     ) -> Result<StepResult, TrapKind> {
         let mut iter = instructions.iterate_from(function_context.position);
         let mut count: u64 = 0;

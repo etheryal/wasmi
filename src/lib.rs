@@ -426,6 +426,7 @@ mod isa;
 mod memory;
 mod module;
 pub mod nan_preserving_float;
+mod park;
 mod prepare;
 mod runner;
 mod table;
